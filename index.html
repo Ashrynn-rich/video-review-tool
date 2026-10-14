@@ -927,50 +927,78 @@ const PG = { W: 2000, H: 1414, M: 70, IMG_W: 1200, COL_X: 1320, COL_W: 610, TOP:
 const PG_FONT = '"PingFang TC","Microsoft JhengHei","Noto Sans TC",sans-serif';
 const STATUS_COLOR = { pending: '#e5484d', fixed: '#f5a524', confirmed: '#2fb15c', wontfix: '#9aa0aa' };
 
-/* 為一則評論排版成 1～多頁：截圖在左上，附件在截圖下方，文字在右欄 */
+/* 為一則評論排版成 1～多頁。依畫面比例自動切換版型：
+   橫式：畫面在左上、文字在右、附件在畫面下方（整頁寬度）
+   直式／近正方形：畫面撐滿整頁高度在左、文字與附件都在右邊
+   原則：畫面優先；附件盡量同一頁（放不下先整體縮小，縮到一半仍放不下才接續頁） */
 async function renderCommentPages(c, n, total, fcv, title) {
   const out = [], f = cFrame(c), st = STATUS[c.status];
   const atts = []; for (const u of c.attachments) { try { atts.push(await loadImg(u)); } catch {} }
   const mctx = document.createElement('canvas').getContext('2d');
-  // 截圖大小：有附件時縮小一點，把下方空間留給附件
-  const maxImgH = atts.length ? 690 : PG.BOTTOM - PG.TOP;
-  const isc = Math.min(PG.IMG_W / fcv.width, maxImgH / fcv.height), iw = fcv.width * isc, ih = fcv.height * isc;
 
-  // 右欄文字分頁（第 1 頁含作者／狀態，標題區較高）
+  // ---- 版型：畫面大小與右欄位置 ----
+  const portrait = fcv.width / fcv.height < 1.15;
+  let iw, ih, colX, colW;
+  if (portrait) {
+    const sc = Math.min((PG.BOTTOM - PG.TOP) / fcv.height, 760 / fcv.width);
+    iw = fcv.width * sc; ih = fcv.height * sc; colX = PG.M + iw + 50; colW = PG.W - PG.M - colX;
+  } else {
+    const sc = Math.min(PG.IMG_W / fcv.width, (atts.length ? 690 : PG.BOTTOM - PG.TOP) / fcv.height);
+    iw = fcv.width * sc; ih = fcv.height * sc; colX = PG.COL_X; colW = PG.COL_W;
+  }
+
+  // ---- 右欄文字分頁（第 1 頁含作者／狀態，標題區較高）----
   const START0 = PG.TOP + 240, START1 = PG.TOP + 136;
   const tpages = [[]]; let ty = START0;
   const addLine = (str, font, color, h) => {
     if (ty + h > PG.BOTTOM) { tpages.push([]); ty = START1; }
     tpages[tpages.length - 1].push({ str, font, color, y: ty, h }); ty += h;
   };
-  if (c.text) { mctx.font = '36px ' + PG_FONT; wrapLines(mctx, c.text, PG.COL_W).forEach(l => addLine(l, '36px ' + PG_FONT, '#111', 52)); }
+  if (c.text) { mctx.font = '36px ' + PG_FONT; wrapLines(mctx, c.text, colW).forEach(l => addLine(l, '36px ' + PG_FONT, '#111', 52)); }
   else if (c.strokes.length) addLine('（僅標註畫面）', '32px ' + PG_FONT, '#8a8f98', 52);
   const reps = c.replies.filter(r => !r.deleted);
   if (reps.length) {
     ty += 14; addLine('回覆', 'bold 28px ' + PG_FONT, '#8a8f98', 42);
-    for (const r of reps) { mctx.font = '30px ' + PG_FONT; wrapLines(mctx, r.author + '：' + r.text, PG.COL_W).forEach(l => addLine(l, '30px ' + PG_FONT, '#444', 44)); ty += 8; }
+    for (const r of reps) { mctx.font = '30px ' + PG_FONT; wrapLines(mctx, r.author + '：' + r.text, colW).forEach(l => addLine(l, '30px ' + PG_FONT, '#444', 44)); ty += 8; }
   }
 
-  // 附件分頁：用整頁寬度，從「截圖與右欄文字」的下緣開始排；1 張放大、2 張並排、3 張以上每排 3 張，放不下就接下一頁
-  const apages = [{ y0: 0, items: [] }], FULL_W = PG.W - PG.M * 2, gap = 24;
+  // ---- 附件：第 k 頁可用的區域 ----
   const region = k => {
     const tb = (tpages[k] || []).reduce((m, t) => Math.max(m, t.y + t.h), k === 0 ? START0 : START1);
-    const y0 = Math.max(PG.TOP + ih, tb) + 36; return { y0, atop: y0 + 44, ah: PG.BOTTOM - (y0 + 44) };
+    const y0 = (portrait ? tb : Math.max(PG.TOP + ih, tb)) + 36;
+    return { x0: portrait ? colX : PG.M, w: portrait ? colW : PG.W - PG.M * 2, y0, atop: y0 + 44, ah: PG.BOTTOM - (y0 + 44) };
   };
+  const apages = [{ x0: 0, y0: 0, items: [] }];
   if (atts.length) {
-    const per = atts.length === 1 ? 1 : atts.length === 2 ? 2 : 3, cellW = (FULL_W - gap * (per - 1)) / per;
-    const layoutRow = (imgs, R) => imgs.map((im, k) => { const sc = Math.min(cellW / im.width, R.ah / im.height, 1.6); return { im, w: im.width * sc, h: im.height * sc, x: PG.M + k * (cellW + gap) }; });
-    const nextPage = () => { apages.push({ y0: 0, items: [] }); return region(apages.length - 1); };
-    let R = region(0), ay = 0; apages[0].y0 = R.y0;
-    for (let i = 0; i < atts.length; i += per) {
-      const imgs = atts.slice(i, i + per); let row = layoutRow(imgs, R);
-      while (R.ah < 160 || (ay > 0 && ay + Math.max(...row.map(r => r.h)) > R.ah)) { R = nextPage(); ay = 0; apages[apages.length - 1].y0 = R.y0; row = layoutRow(imgs, R); }
-      const rh = Math.max(...row.map(r => r.h));
-      row.forEach(r => apages[apages.length - 1].items.push({ ...r, y: R.atop + ay }));
-      ay += rh + 16;
+    const per = portrait ? (atts.length === 1 ? 1 : 2) : (atts.length === 1 ? 1 : atts.length === 2 ? 2 : 3), gap = 24, rowGap = 16;
+    const layoutRow = (imgs, R) => {
+      const cellW = (R.w - gap * (per - 1)) / per;
+      const capH = per === 1 ? Math.max(R.ah, 1) : Math.min(Math.max(R.ah, 1), 560);
+      return imgs.map((im, k) => { const sc = Math.min(cellW / im.width, capH / im.height, 1.6); return { im, w: im.width * sc, h: im.height * sc, x: R.x0 + k * (cellW + gap) }; });
+    };
+    const groups = []; for (let i = 0; i < atts.length; i += per) groups.push(atts.slice(i, i + per));
+    const R0 = region(0), rows0 = groups.map(g => layoutRow(g, R0));
+    const hs = rows0.map(r => Math.max(...r.map(x => x.h))), tot = hs.reduce((a, b) => a + b, 0) + rowGap * (rows0.length - 1);
+    Object.assign(apages[0], { x0: R0.x0, y0: R0.y0 });
+    if (R0.ah >= 160 && R0.ah / tot >= 0.5) {
+      // 盡量同一頁：放不下就整體縮小（最多縮到一半）
+      const k = Math.min(1, R0.ah / tot); let ay = 0;
+      rows0.forEach((row, ri) => { row.forEach(x => apages[0].items.push({ im: x.im, x: R0.x0 + (x.x - R0.x0) * k, w: x.w * k, h: x.h * k, y: R0.atop + ay })); ay += hs[ri] * k + rowGap; });
+    } else {
+      // 縮到一半仍放不下：維持原尺寸，一排一排排，放不下就接下一頁
+      let R = R0, ay = 0;
+      const nextPage = () => { apages.push({ x0: 0, y0: 0, items: [] }); const r = region(apages.length - 1); Object.assign(apages[apages.length - 1], { x0: r.x0, y0: r.y0 }); return r; };
+      for (const imgs of groups) {
+        let row = layoutRow(imgs, R);
+        while (R.ah < 160 || (ay > 0 && ay + Math.max(...row.map(r => r.h)) > R.ah)) { R = nextPage(); ay = 0; row = layoutRow(imgs, R); }
+        const rh = Math.max(...row.map(r => r.h));
+        row.forEach(r => apages[apages.length - 1].items.push({ ...r, y: R.atop + ay }));
+        ay += rh + rowGap;
+      }
     }
   }
 
+  // ---- 逐頁繪製 ----
   const N = Math.max(tpages.length, atts.length ? apages.length : 1);
   for (let k = 0; k < N; k++) {
     const cn = document.createElement('canvas'); cn.width = PG.W; cn.height = PG.H;
@@ -978,21 +1006,18 @@ async function renderCommentPages(c, n, total, fcv, title) {
     ctx.font = '28px ' + PG_FONT; ctx.fillStyle = '#8a8f98'; ctx.fillText(title, PG.M, 40);
     ctx.textAlign = 'right'; ctx.fillText('評論 ' + n + ' / ' + total, PG.W - PG.M, PG.H - 56); ctx.textAlign = 'left';
     ctx.drawImage(fcv, PG.M, PG.TOP, iw, ih); ctx.strokeStyle = '#d8dbe0'; ctx.lineWidth = 2; ctx.strokeRect(PG.M, PG.TOP, iw, ih);
-    // 右欄標題
     let y = PG.TOP;
-    ctx.fillStyle = '#111'; ctx.font = 'bold 46px ' + PG_FONT; ctx.fillText('#' + n + (k ? '（續）' : '') + '　第 ' + f + ' 幀', PG.COL_X, y); y += 64;
-    ctx.font = '34px ' + PG_FONT; ctx.fillStyle = '#555'; ctx.fillText(tc(f), PG.COL_X, y); y += 50;
+    ctx.fillStyle = '#111'; ctx.font = 'bold 46px ' + PG_FONT; ctx.fillText('#' + n + (k ? '（續）' : '') + '　第 ' + f + ' 幀', colX, y); y += 64;
+    ctx.font = '34px ' + PG_FONT; ctx.fillStyle = '#555'; ctx.fillText(tc(f), colX, y); y += 50;
     if (k === 0) {
-      ctx.font = '30px ' + PG_FONT; ctx.fillText(c.author + '　' + fmtTime(c.createdAt), PG.COL_X, y); y += 46;
-      ctx.fillStyle = STATUS_COLOR[c.status]; ctx.beginPath(); ctx.arc(PG.COL_X + 14, y + 20, 13, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#111'; ctx.font = 'bold 32px ' + PG_FONT; ctx.fillText(st.label, PG.COL_X + 40, y + 2); y += 58;
+      ctx.font = '30px ' + PG_FONT; ctx.fillText(c.author + '　' + fmtTime(c.createdAt), colX, y); y += 46;
+      ctx.fillStyle = STATUS_COLOR[c.status]; ctx.beginPath(); ctx.arc(colX + 14, y + 20, 13, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#111'; ctx.font = 'bold 32px ' + PG_FONT; ctx.fillText(st.label, colX + 40, y + 2); y += 58;
     }
-    ctx.strokeStyle = '#d8dbe0'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(PG.COL_X, y); ctx.lineTo(PG.COL_X + PG.COL_W, y); ctx.stroke();
-    // 右欄文字
-    (tpages[k] || []).forEach(t => { ctx.font = t.font; ctx.fillStyle = t.color; ctx.fillText(t.str, PG.COL_X, t.y); });
-    // 截圖下方的附件
+    ctx.strokeStyle = '#d8dbe0'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(colX, y); ctx.lineTo(colX + colW, y); ctx.stroke();
+    (tpages[k] || []).forEach(t => { ctx.font = t.font; ctx.fillStyle = t.color; ctx.fillText(t.str, colX, t.y); });
     if (atts.length && apages[k] && apages[k].items.length) {
-      ctx.font = 'bold 28px ' + PG_FONT; ctx.fillStyle = '#8a8f98'; ctx.fillText(k ? '附件（續）' : '附件', PG.M, apages[k].y0);
+      ctx.font = 'bold 28px ' + PG_FONT; ctx.fillStyle = '#8a8f98'; ctx.fillText(k ? '附件（續）' : '附件', apages[k].x0, apages[k].y0);
       apages[k].items.forEach(r => { ctx.drawImage(r.im, r.x, r.y, r.w, r.h); ctx.strokeStyle = '#d8dbe0'; ctx.lineWidth = 2; ctx.strokeRect(r.x, r.y, r.w, r.h); });
     }
     const b = await canvasJpeg(cn); out.push({ w: PG.W, h: PG.H, data: new Uint8Array(await b.arrayBuffer()) });
